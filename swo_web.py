@@ -895,7 +895,8 @@ def disasm_window(d, addr=None, name=None):
 def watch_setfmt(name, fmt):
     """行内改格式：只换解释（f32/i32/hex 互换不动提取）；u16/u8 连子字
     提取宽度一起换。"""
-    if fmt not in ("u32", "i32", "hex", "u16", "i16", "u8", "i8", "f32"):
+    if fmt not in ("u32", "i32", "hex", "u16", "i16", "u8", "i8",
+                   "f32", "u64", "i64", "f64"):
         return False, "bad fmt"
     for w in ST.watches:
         if w["name"] == name:
@@ -927,17 +928,21 @@ def watch_add(name, fmt, win=1):
         win = max(0, min(4, int(win)))
     except (TypeError, ValueError):
         win = 1
+    SIZE_MAP = {"u16": 2, "i16": 2, "u8": 1, "i8": 1,
+                "u64": 8, "i64": 8, "f64": 8}
     ent = ST.sym_by_name.get(name)
     if ent:
         addr, size, disp = ent[0], ent[1], name
-        if size > 4:
-            size = 4              # 数组/结构体：先看第一个字
+        if fmt in SIZE_MAP:
+            size = SIZE_MAP[fmt]  # fmt 覆盖符号大小
+        elif size > 8:
+            size = 8              # 数组/结构体：先看前 8 字节
     else:
         try:
             addr = int(name, 0)
         except ValueError:
             return False, f"符号未找到: {name}"
-        size = {"u16": 2, "i16": 2, "u8": 1, "i8": 1}.get(fmt, 4)
+        size = SIZE_MAP.get(fmt, 4)
         disp = f"0x{addr:08x}"
     if not any(w["addr"] == addr and w["name"] == disp for w in ST.watches):
         ST.watches.append({"name": disp, "addr": addr, "size": size,
@@ -969,11 +974,17 @@ async def watch_loop():
                     for k, v in enumerate(vals):
                         words[b + 4 * k] = v
                 for w in ST.watches:
-                    word = words.get(w["addr"] & ~3)
-                    if word is not None and w["size"] < 4:
-                        # 子字变量：按字节地址移位掩码（u16/u8）
-                        sh = (w["addr"] & 3) * 8
-                        word = (word >> sh) & ((1 << (w["size"] * 8)) - 1)
+                    base = w["addr"] & ~3
+                    if w["size"] == 8:
+                        # 8 字节：合并两个相邻 32 位字（小端低字在前）
+                        lo = words.get(base, 0)
+                        hi = words.get(base + 4, 0)
+                        word = lo | (hi << 32)
+                    else:
+                        word = words.get(base)
+                        if word is not None and w["size"] < 4:
+                            sh = (w["addr"] & 3) * 8
+                            word = (word >> sh) & ((1 << (w["size"] * 8)) - 1)
                     w["series"].append((now, word))
                     w["n"] = w.get("n", 0) + 1
         except Exception:
@@ -2385,7 +2396,9 @@ color:var(--dim);flex:none;white-space:nowrap;overflow:hidden}
   <select id="wfmt"><option value="u32">u32</option><option value="i32">i32</option>
    <option value="hex">hex</option><option value="u16">u16</option>
    <option value="i16">i16</option><option value="u8">u8</option>
-   <option value="i8">i8</option><option value="f32">f32</option></select>
+   <option value="i8">i8</option><option value="f32">f32</option>
+   <option value="u64">u64</option><option value="i64">i64</option>
+   <option value="f64">f64</option></select>
   <button class="tbtn" onclick="watchAdd()">添加</button>
   <button class="tbtn warn" onclick="watchClr()">清空</button>
   <span class="hint" id="winfo"></span>
@@ -2996,6 +3009,7 @@ let wModeV="line",wPaused=false;
 const wTrig={on:false,fired:false,var:"",cmp:">",v:0,t0:0};
 let _wsig="";
 const _f32b=new ArrayBuffer(4),_f32u=new Uint32Array(_f32b),_f32f=new Float32Array(_f32b);
+const _f64b=new ArrayBuffer(8),_f64u=new Uint32Array(_f64b),_f64f=new Float64Array(_f64b);
 function wNum(w,v){             // 原始 u 值 -> 按 fmt 的数值
   if(v==null)return null;
   switch(w.fmt){
@@ -3005,9 +3019,14 @@ function wNum(w,v){             // 原始 u 值 -> 按 fmt 的数值
     case"u8":return (v>>>0)&0xFF;
     case"i8":{const x=v&0xFF;return x>=0x80?x-0x100:x;}
     case"f32":_f32u[0]=v>>>0;return _f32f[0];
+    case"u64":return Number(v);        /* JS Number 精确到 2^53 够用 */
+    case"i64":return v>0x7FFFFFFFFFFFF?
+      v-0x10000000000000000:Number(v):Number(v);
+    case"f64":_f64u[0]=v&0xFFFFFFFF;_f64u[1]=Math.floor(v/0x100000000);return _f64f[0];
     default:return v>>>0;}}
 function wStr(w,v){const x=wNum(w,v);return x==null?"—":
-  w.fmt==="f32"?x.toFixed(4):w.fmt==="hex"?"0x"+x.toString(16):String(x);}
+  w.fmt==="f32"?x.toFixed(4):w.fmt==="f64"?x.toFixed(6):
+      w.fmt==="hex"?"0x"+x.toString(16):String(x);}
 async function watchAdd(){
  const n=$("wname").value.trim();if(!n)return;
  const r=await post("/api/watch",{action:"add",name:n,fmt:$("wfmt").value});
@@ -3096,7 +3115,7 @@ function renderWatch(s){
     const tb=$("w_tbl").querySelector("tbody");
     tb.innerHTML=s.watches.map((w,i)=>{
       const[lo,hi]=wRange(w);
-      const fsel=["u32","i32","hex","u16","i16","u8","i8","f32"].map(f=>
+      const fsel=["u32","i32","hex","u16","i16","u8","i8","f32","u64","i64","f64"].map(f=>
         `<option${f===w.fmt?" selected":""}>${f}</option>`).join("");
       const wsel=[1,2,3,4].map(k=>
         `<option value="${k}"${(w.win??1)===k?" selected":""}>窗${k}</option>`).join("")+
