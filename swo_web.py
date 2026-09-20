@@ -1033,21 +1033,30 @@ async def swo_loop():
             continue
         ST.swo_ok = True
         ST.swo_state = "reading"
+        _wd_count = 0
         try:
             while True:
                 try:
-                    data = await asyncio.wait_for(r.read(4096), 10.0)
+                    data = await asyncio.wait_for(r.read(4096), 5.0)
+                    _wd_count = 0
                 except asyncio.TimeoutError:
-                    # DWT 在产流却 10s 零字节 = 目标 SWO 输出静默卡死
-                    # （寄存器全对、线 idle），swo_tpiu 重配（内含 SWJ_CFG
-                    # 循环）一踢即活
-                    if ST.pc_on or ST.exc_on:
-                        ST.swo_state = "静默>10s，重配踢活中"
+                    _wd_count += 1
+                    # 两个触发条件（任一满足即重配）：
+                    # 1) 完全静默 ≥10s = 目标 SWO 输出停了（传统看门狗）
+                    # 2) 目标 running 但 mhz=0 且 ≥15s = CYCCNT 不跑
+                    #    （板子重启后线上有零星残留字节，静默检测不够灵敏）
+                    need = (ST.pc_on or ST.exc_on) and (
+                        _wd_count >= 2 or
+                        (ST.tgt_state == "running" and ST.mhz == 0.0
+                         and _wd_count >= 3))
+                    if need:
+                        ST.swo_state = "自动重配踢活中"
                         try:
-                            await OCD.swo_tpiu(ST.swo_traceclk, ST.swo_baud)
+                            await OCD.swo_tpiu(ST.swo_traceclk, SWO_PINFREQ)
                         except Exception:
                             pass
                         ST.swo_state = "reading"
+                        _wd_count = 0
                     continue
                 if not data:
                     break
