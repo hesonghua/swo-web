@@ -3340,7 +3340,8 @@ function drawGauge(s){
   const col=i%cols,row=(i/cols)|0;
   const cw=W/cols,cx=col*cw+cw/2,cy=row*170+85,R=Math.min(cw/2,170/2)-24;
   const[lo,hi]=wRange(w);
-  const cur=w.series.length?wNum(w,w.series[w.series.length-1][1]):null;
+  const raw=w.series.length?w.series[w.series.length-1][1]:null;  /* 原始位 */
+  const cur=raw!=null?wNum(w,raw):null;
   const frac=cur==null?0:Math.max(0,Math.min(1,(cur-lo)/(hi-lo||1)));
   const a0=Math.PI*0.75,a1=Math.PI*2.25,na=a0+(a1-a0)*frac;
   x.strokeStyle=cvc("#232e3b","#c8d3dd");x.lineWidth=8;
@@ -3366,7 +3367,8 @@ function drawBits(s){
  const[cv,x,W,H]=wCanvas(ws.length*46+14);
  ws.forEach((w,i)=>{
   const y=14+i*46,n=w.size*8;
-  const cur=w.series.length?wNum(w,w.series[w.series.length-1][1]):null;
+  const raw=w.series.length?w.series[w.series.length-1][1]:null;  /* 原始位 */
+  const cur=raw!=null?wNum(w,raw):null;
   const bw=Math.max(8,Math.min(30,Math.floor((W-240)/n)));
   x.font="11px monospace";x.fillStyle=DCOLORS[i%8];
   x.fillText(w.name.slice(0,20),8,y+13);
@@ -3374,7 +3376,7 @@ function drawBits(s){
   x.fillText(cur==null?"—":wStr(w,cur),8,y+32);
   for(let b=0;b<n;b++){
    const bx=W-12-(n-b)*bw;
-   const lit=cur!=null&&((cur>>>b)&1);
+   const lit=raw!=null&&((raw>>>b)&1);  /* IEEE754 原始位（不是数值的位）*/
    x.fillStyle=lit?DCOLORS[i%8]:cvc("#232e3b","#c8d3dd");
    x.fillRect(bx,y,bw-3,18);
    if(b%8===7){x.fillStyle=cvc("#5b6b7c","#66778a");x.font="9px monospace";
