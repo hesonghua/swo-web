@@ -976,11 +976,18 @@ async def watch_loop():
                     for k, v in enumerate(vals):
                         words[b + 4 * k] = v
                 for w in ST.watches:
-                    base = w["addr"] & ~7  # 8 字节对齐
-                    word = words.get(base) | (words.get(base + 4, 0) << 32)
-                    if w["size"] < 4 and word is not None:
-                        sh = (w["addr"] & 3) * 8
-                        word = (word >> sh) & ((1 << (w["size"] * 8)) - 1)
+                    if w["size"] == 8:
+                        # 8 字节：合并两个相邻 32 位字（小端低字在前）
+                        base = w["addr"] & ~7
+                        word = (words.get(base) or 0) | \
+                               ((words.get(base + 4) or 0) << 32)
+                    else:
+                        # 1/2/4 字节：只取对应的 32 位字
+                        base = w["addr"] & ~3
+                        word = words.get(base)
+                        if word is not None and w["size"] < 4:
+                            sh = (w["addr"] & 3) * 8
+                            word = (word >> sh) & ((1 << (w["size"] * 8)) - 1)
                     w["series"].append((now, word))
                     w["n"] = w.get("n", 0) + 1
         except Exception:
