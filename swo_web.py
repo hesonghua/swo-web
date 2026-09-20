@@ -617,7 +617,9 @@ class Ocd:
         return dict(zip(REG_NAMES[:len(vals)], vals))
 
     async def mem_read(self, addr, count, width=4):
-        """-> [int]（宽度 width 字节，LE）。"""
+        """-> [int]（宽度 width 字节，LE；width=8 由板端两条 32 位读合并）。"""
+        if width == 8:
+            count = max(1, min(512, count))
         b = await self._xchg(BIN_MEM_RD,
                              struct.pack("<IBH", addr, width,
                                          max(1, min(1024, count))))
@@ -974,17 +976,11 @@ async def watch_loop():
                     for k, v in enumerate(vals):
                         words[b + 4 * k] = v
                 for w in ST.watches:
-                    base = w["addr"] & ~3
-                    if w["size"] == 8:
-                        # 8 字节：合并两个相邻 32 位字（小端低字在前）
-                        lo = words.get(base, 0)
-                        hi = words.get(base + 4, 0)
-                        word = lo | (hi << 32)
-                    else:
-                        word = words.get(base)
-                        if word is not None and w["size"] < 4:
-                            sh = (w["addr"] & 3) * 8
-                            word = (word >> sh) & ((1 << (w["size"] * 8)) - 1)
+                    base = w["addr"] & ~7  # 8 字节对齐
+                    word = words.get(base) | (words.get(base + 4, 0) << 32)
+                    if w["size"] < 4 and word is not None:
+                        sh = (w["addr"] & 3) * 8
+                        word = (word >> sh) & ((1 << (w["size"] * 8)) - 1)
                     w["series"].append((now, word))
                     w["n"] = w.get("n", 0) + 1
         except Exception:
