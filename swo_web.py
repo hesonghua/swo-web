@@ -1227,10 +1227,15 @@ async def ws_con_forwarder(sess):
 async def ws_pusher(sess):
     """周期推送：status + 当前 tab 载荷（120ms ≈ 8fps，丝滑的关键）。"""
     q = sess["q"]
+    print("[PUSHER-START]", flush=True)
     try:
         while True:
             await asyncio.sleep(0.05)
-            st = api_status()
+            try:
+                st = api_status()
+            except Exception as _e:
+                print(f"[push-status-err] {_e!r}", flush=True)
+                continue
             tab = sess["tab"]
             payload = {"t": "push", "status": st, "tab": tab}
             try:
@@ -1294,9 +1299,12 @@ async def ws_pusher(sess):
             except Exception:
                 pass
             try:
-                q.put_nowait(payload)
-            except asyncio.QueueFull:
-                pass
+                _w = sess.get("_writer")
+                if _w and not _w.is_closing():
+                    _w.write(ws_encode(json.dumps(payload, ensure_ascii=False)))
+            except Exception as _e:
+                print(f"[push-direct-err] {_e!r}", flush=True)
+                break
     except asyncio.CancelledError:
         pass
 
@@ -1477,7 +1485,7 @@ async def ws_session(reader, writer, headers):
         writer.close()
         return
     sess = {"q": asyncio.Queue(maxsize=400), "tab": "console",
-            "conport": 0, "con_q": None}
+            "conport": 0, "con_q": None, "_writer": writer}
     ws_sub_con(sess, 0)
     tasks = [asyncio.create_task(t) for t in (
         ws_con_forwarder(sess), ws_pusher(sess))]
@@ -1486,14 +1494,26 @@ async def ws_session(reader, writer, headers):
         try:
             while True:
                 obj = await sess["q"].get()
-                writer.write(ws_encode(
-                    obj if isinstance(obj, str)
-                    else json.dumps(obj, ensure_ascii=False)))
-                await writer.drain()
+                try:
+                    writer.write(ws_encode(
+                        obj if isinstance(obj, str)
+                        else json.dumps(obj, ensure_ascii=False)))
+                    await writer.drain()
+                except Exception as _e:
+                    print(f"[send-err] {_e!r}", flush=True)
+                    break
         except Exception:
             pass
 
-    tasks.append(asyncio.create_task(sender()))
+    _send_task = asyncio.create_task(sender())
+    tasks.append(_send_task)
+    # 3 秒后检查 sender 是否还活着
+    async def _check():
+        await asyncio.sleep(3)
+        print(f"[CHECK] sender done={_send_task.done()} cancelled={_send_task.cancelled()}", flush=True)
+        if _send_task.done() and not _send_task.cancelled():
+            print(f"[CHECK] sender exception={_send_task.exception()!r}", flush=True)
+    tasks.append(asyncio.create_task(_check()))
     try:
         while True:
             raw = await ws_read_msg(reader, writer)
@@ -3016,8 +3036,7 @@ function wNum(w,v){             // 原始 u 值 -> 按 fmt 的数值
     case"i8":{const x=v&0xFF;return x>=0x80?x-0x100:x;}
     case"f32":_f32u[0]=v>>>0;return _f32f[0];
     case"u64":return Number(v);        /* JS Number 精确到 2^53 够用 */
-    case"i64":return v>0x7FFFFFFFFFFFF?
-      v-0x10000000000000000:Number(v):Number(v);
+    case"i64":return v>0x7FFFFFFFFFFFFF?v-0x10000000000000000:Number(v);
     case"f64":_f64u[0]=v&0xFFFFFFFF;_f64u[1]=Math.floor(v/0x100000000);return _f64f[0];
     default:return v>>>0;}}
 function wStr(w,v){const x=wNum(w,v);return x==null?"—":
