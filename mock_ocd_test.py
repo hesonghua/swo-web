@@ -118,6 +118,8 @@ def dispatch(cmd, p, out):
         return out.write(struct.pack("<I", 4032258))
     if cmd == S.BIN_SWO_STAT:
         return out.write(bytes([0, 0, 0, 0]))
+    if cmd == S.BIN_VREF:
+        return out.write(struct.pack("<I", 3301))   # 3.301 V
     return out.err(f"unknown cmd 0x{cmd:02X}")
 
 

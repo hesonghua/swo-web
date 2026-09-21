@@ -65,6 +65,7 @@ const ST = {
     exc_events: 0, exc_recent: [], exc_mispaired: 0,
     resyncs: 0, overflows: 0, gtc: 0,
     mhz: 0, exc_ps: 0, sleep_pct: 0, dwt_raw: [0,0,0,0,0,0],
+    vref_mv: null,   /* JTAG Vref（null=未知/无硬件）；vrefLoop 低频刷新 */
     pc_on: false, exc_on: false,
     ocd_ok: false, swo_ok: false,
     swo_traceclk: 72000000, swo_baud: SWO_PINFREQ,
@@ -164,7 +165,7 @@ const BIN = {
     PING:1, CMD:2, HALTINFO:3, HALT:4, RESUME:5, STEP:6,
     REG_RD:7, REG_WR:8, MEM_RD:9, MEM_WR:0xA,
     BP_ADD:0xB, BP_DEL:0xC, WP_ADD:0xD, WP_DEL:0xE, BPS:0xF,
-    SWO_TPIU:0x10, SWO_STAT:0x11, REPROBE:0x12, ERR:0x7F,
+    SWO_TPIU:0x10, SWO_STAT:0x11, REPROBE:0x12, VREF:0x13, ERR:0x7F,
 };
 const REG_NAMES = ["r0","r1","r2","r3","r4","r5","r6","r7","r8","r9","r10","r11","r12",
                    "sp","lr","pc","xpsr","msp","psp","primask","basepri","faultmask","control"];
@@ -299,6 +300,14 @@ class Ocd {
     async swoStat() {
         const b = await this.xchg(BIN.SWO_STAT);
         return { cnt: b[0] | (b[1] << 8), ovr: b[2], fe: b[3] };
+    }
+    async vref() {
+        /* JTAG Vref（mV）。板侧旧 jtag_tool（无 0x13）或无硬件返回 null */
+        try {
+            const b = await this.xchg(BIN.VREF);
+            if (b.length >= 4) return b.readUInt32LE(0);
+        } catch (e) { /* 静默：UI 显示 — */ }
+        return null;
     }
     async setTrace(pc = null, exc = null) {
         if (pc !== null) ST.pc_on = pc;
@@ -634,6 +643,15 @@ async function dwtLoop() {
     }
 }
 
+/* 低频轮询 JTAG Vref（板侧 SPI 两段式 ~6ms 会暂停 SWO 排水，10s 摊薄） */
+async function vrefLoop() {
+    while (true) {
+        const mv = await OCD.vref();
+        if (mv !== null) ST.vref_mv = mv;
+        await new Promise(r => setTimeout(r, 10000));
+    }
+}
+
 async function watchLoop() {
     if (!ST.watches.length || ST.tgt_state === "unknown" || !OCD.sock) return;
     const ws = [...ST.watches].sort((a, b) => a.addr - b.addr);
@@ -701,6 +719,7 @@ function apiStatus() {
         pc_total: ST.pc_total, pc_sleep: ST.pc_sleep,
         exc_events: ST.exc_events,
         resyncs: ST.resyncs, overflows: ST.overflows,
+        vref_mv: ST.vref_mv,
         tgt_state: ST.tgt_state, halt_reason: ST.halt_reason,
         halt_pc: ST.halt_pc !== null ? "0x" + ST.halt_pc.toString(16).padStart(8, "0") : null,
         backend: "nodejs",
@@ -1413,6 +1432,7 @@ color:var(--dim);flex:none;white-space:nowrap;overflow:hidden}
  <div id="t_state"><span class="b unk">—</span></div>
  <div id="topmetrics">
   <span>CPU <b id="t_mhz">—</b></span>
+  <span>Vref <b id="t_vref">—</b></span>
   <span>样本 <b id="t_pc">0</b></span>
   <span>事件 <b id="t_exc">0</b></span>
   <span>resync <b id="t_rs">0</b></span>
@@ -1848,6 +1868,7 @@ function handlePush(m){
     :s.tgt_state==="running"?"▶ 运行中":"—";
   $("t_state").innerHTML=\`<span class="b \${bcls}">\${esc(btxt)}</span>\`;
   $("t_mhz").textContent=s.mhz?s.mhz.toFixed(2)+" MHz":"—";
+  $("t_vref").textContent=s.vref_mv!=null?(s.vref_mv/1000).toFixed(2)+" V":"—";
   $("t_pc").textContent=s.pc_total.toLocaleString();
   $("t_exc").textContent=s.exc_events.toLocaleString();
   $("t_rs").textContent=s.resyncs.toLocaleString();
@@ -2859,6 +2880,7 @@ async function main() {
     withRetry(tgtLoop, 250).catch(console.error);
     withRetry(dwtLoop, 250).catch(console.error);
     setInterval(() => watchLoop().catch(() => {}), ST.watch_ms);
+    vrefLoop().catch(() => {});
 
     server.listen(PORT, "0.0.0.0", () => {
         console.log(`HTTP listening on :${PORT}`);

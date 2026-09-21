@@ -188,6 +188,8 @@ class State:
         self.mhz = 0.0
         self.exc_ps = 0.0
         self.sleep_pct = 0.0
+        # JTAG Vref（mV，None=未知/无硬件）；vref_loop 低频刷新
+        self.vref_mv = None
         self.dwt_raw = [0] * 6
         self.pc_on = False
         self.exc_on = False
@@ -493,7 +495,7 @@ PARSER = ItmParser(ST)
 BIN_PING, BIN_CMD, BIN_HALTINFO, BIN_HALT, BIN_RESUME, BIN_STEP = 1, 2, 3, 4, 5, 6
 BIN_REG_RD, BIN_REG_WR, BIN_MEM_RD, BIN_MEM_WR = 7, 8, 9, 0xA
 BIN_BP_ADD, BIN_BP_DEL, BIN_WP_ADD, BIN_WP_DEL, BIN_BPS = 0xB, 0xC, 0xD, 0xE, 0xF
-BIN_SWO_TPIU, BIN_SWO_STAT, BIN_REPROBE = 0x10, 0x11, 0x12
+BIN_SWO_TPIU, BIN_SWO_STAT, BIN_REPROBE, BIN_VREF = 0x10, 0x11, 0x12, 0x13
 BIN_ERR = 0x7F
 # 寄存器 sel 序（r0-r12, sp, lr, pc, xpsr, msp, psp, primask, basepri, faultmask, control）
 REG_SELS = bytes([*range(13), 13, 14, 15, 0x10, 0x11, 0x12, 0x14, 0x15, 0x16, 0x17])
@@ -689,6 +691,17 @@ class Ocd:
     async def swo_stat(self):
         b = await self._xchg(BIN_SWO_STAT)
         return (b[0] | (b[1] << 8), b[2], b[3])   # cnt, ovr, fe
+
+    async def vref(self):
+        """JTAG Vref（mV）。板侧经 SPI 问 ESP32 ADC（10k/10k 分压）；
+        板上是旧 jtag_tool（无 0x13）或无硬件时返回 None（不抛——状态栏显示 —）。"""
+        try:
+            b = await self._xchg(BIN_VREF)
+            if len(b) >= 4:
+                return int.from_bytes(b[:4], "little")
+        except Exception:
+            pass
+        return None
 
     async def set_trace(self, pc=None, exc=None):
         v = CYCCNTENA
@@ -966,6 +979,16 @@ def watch_add(name, fmt, win=1):
                            "fmt": fmt, "win": win,
                            "series": deque(maxlen=600)})
     return True, ""
+
+
+async def vref_loop():
+    """低频轮询 JTAG Vref（板侧 SPI 两段式 ~6ms 会暂停 SWO 排水，10s 周期
+    摊薄影响；失败静默保持旧值，UI 显示 —）。"""
+    while True:
+        mv = await OCD.vref()
+        if mv is not None:
+            ST.vref_mv = mv
+        await asyncio.sleep(10)
 
 
 async def watch_loop():
@@ -1597,6 +1620,7 @@ def api_status():
         "pc_total": ST.pc_total, "pc_sleep": ST.pc_sleep,
         "exc_events": ST.exc_events,
         "resyncs": ST.resyncs, "overflows": ST.overflows,
+        "vref_mv": ST.vref_mv,
         "tgt_state": ST.tgt_state, "halt_reason": ST.halt_reason,
         "halt_pc": f"0x{ST.halt_pc:08x}" if ST.halt_pc is not None else None,
         "backend": "jtag_tool", "swo_traceclk": ST.swo_traceclk,
@@ -2239,6 +2263,7 @@ color:var(--dim);flex:none;white-space:nowrap;overflow:hidden}
  <div id="t_state"><span class="b unk">—</span></div>
  <div id="topmetrics">
   <span>CPU <b id="t_mhz">—</b></span>
+  <span>Vref <b id="t_vref">—</b></span>
   <span>样本 <b id="t_pc">0</b></span>
   <span>事件 <b id="t_exc">0</b></span>
   <span>resync <b id="t_rs">0</b></span>
@@ -2674,6 +2699,7 @@ function handlePush(m){
     :s.tgt_state==="running"?"▶ 运行中":"—";
   $("t_state").innerHTML=`<span class="b ${bcls}">${esc(btxt)}</span>`;
   $("t_mhz").textContent=s.mhz?s.mhz.toFixed(2)+" MHz":"—";
+  $("t_vref").textContent=s.vref_mv!=null?(s.vref_mv/1000).toFixed(2)+" V":"—";
   $("t_pc").textContent=s.pc_total.toLocaleString();
   $("t_exc").textContent=s.exc_events.toLocaleString();
   $("t_rs").textContent=s.resyncs.toLocaleString();
@@ -3522,6 +3548,7 @@ async def main(port):
     asyncio.create_task(dwt_loop())
     asyncio.create_task(tgt_loop())
     asyncio.create_task(watch_loop())
+    asyncio.create_task(vref_loop())
     print(f"swo_web: http://0.0.0.0:{port}  elf={ST.elf_path} "
           f"({len(ST.syms)} syms + {len(ST.objs)} objs)  "
           f"board={BOARD_HOST} -> {board_addr(BOARD_HOST)}  "
