@@ -1856,8 +1856,14 @@ async def handle_http(reader, writer):
                                             ) if ST.pc_on and ST.exc_on else ""})
             elif p == "/api/target":
                 act = body.get("action", "")
-                if act in ("halt", "resume"):
-                    out = await OCD.cmd(act)
+                if act == "halt":
+                    # BIN 路径（不走文本命令）：错误应答带 g_err_last 具体原因，
+                    # 且 swo_web 三层恢复（连续失败自动 reprobe）能兜住
+                    pc = await OCD.halt()
+                    out = f"halted pc=0x{pc:08x}" if pc else "halt"
+                elif act == "resume":
+                    await OCD.resume()
+                    out = "resumed"
                 elif act == "reset":
                     # AIRCR SYSRESETREQ
                     await OCD.mww(0xE000ED0C, 0x05FA0004)
