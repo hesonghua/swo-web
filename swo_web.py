@@ -1384,10 +1384,10 @@ async def ws_dispatch(sess, m):
     elif t == "conback":
         port = max(0, min(31, int(m.get("v", 0))))
         buf = ST.text if port == 0 else ST.chan_text.get(port)
-        reply({"t": "conback", "s": "".join(buf)[-6000:] if buf else ""})
+        reply({"t": "conback", "s": "".join(buf)[-16000:] if buf else ""})
     elif t == "cmd":
         reply({"t": "resp", "out": (await OCD.cmd(
-            str(m.get("line", ""))[:200], timeout=8.0)).strip()[-2000:]})
+            str(m.get("line", ""))[:200], timeout=8.0)).strip()[-16000:]})
     elif t == "action":
         a = m.get("a", "")
         if a in ("halt", "resume"):

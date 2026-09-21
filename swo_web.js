@@ -928,9 +928,9 @@ async function handleWsMessage(sess, msg) {
         else if (t === "conport") sess.conport = msg.v || 0;
         else if (t === "conback") {
             const buf = sess.conport === 0 ? ST.text : (ST.chan_text.get(sess.conport) || []);
-            reply({ s: buf.slice(-6000).join("") });
+            reply({ s: buf.slice(-16000).join("") });
         }
-        else if (t === "cmd") reply({ out: (await OCD.cmd(String(msg.line || "").slice(0, 200))).slice(-2000) });
+        else if (t === "cmd") reply({ out: (await OCD.cmd(String(msg.line || "").slice(0, 200))).slice(-16000) });
         else if (t === "action") {
             const a = msg.a || "";
             if (a === "halt") await OCD.halt();
