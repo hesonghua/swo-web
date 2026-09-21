@@ -1390,8 +1390,12 @@ async def ws_dispatch(sess, m):
             str(m.get("line", ""))[:200], timeout=8.0)).strip()[-16000:]})
     elif t == "action":
         a = m.get("a", "")
-        if a in ("halt", "resume"):
-            out = await OCD.cmd(a)
+        if a == "halt":
+            pc = await OCD.halt()
+            out = f"halted pc=0x{pc:08x}" if pc else "halt"
+        elif a == "resume":
+            await OCD.resume()
+            out = "resumed"
         elif a == "reset":
             await OCD.mww(0xE000ED0C, 0x05FA0004)
             out = "reset (SYSRESETREQ)"
@@ -1982,7 +1986,7 @@ async def handle_http(reader, writer):
                 json_resp(writer, {"traceclk": tc, "out": f"RX {actual} Hz"})
             elif p == "/api/cmd":
                 out = await OCD.cmd(str(body.get("cmd", ""))[:200])
-                json_resp(writer, {"out": out.strip()[-2000:]})
+                json_resp(writer, {"out": out.strip()[-16000:]})
             else:
                 writer.write(b"HTTP/1.0 404 Not Found\r\n\r\n")
     except Exception as e:
@@ -2604,7 +2608,7 @@ function wsConnect(){
   ws.onmessage=e=>{const m=JSON.parse(e.data);
     if(m.id&&wsPend[m.id]){wsPend[m.id](m);delete wsPend[m.id];return;}
     if(m.t==="push")handlePush(m);
-    else if(m.t==="con"){con.textContent+=m.s;
+    else if(m.t==="con"){con.textContent=(con.textContent+m.s).slice(-400000);
       if($("autoscroll").checked)con.scrollTop=con.scrollHeight;}};
   ws.onclose=()=>{setTimeout(wsConnect,1000);};}
 function wsSend(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}

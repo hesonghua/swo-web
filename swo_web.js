@@ -180,6 +180,7 @@ class Ocd {
     connect() {
         return new Promise((resolve, reject) => {
             const sock = net.connect(OCD_PORT, ST._boardIp, () => {
+                sock.setKeepAlive(true, 5000);   /* 板子双网卡 IP 漂移防静默死连 */
                 this.sock = sock;
                 ST.ocd_ok = true;
                 this.xchg(BIN.SWO_TPIU, this.packII(ST.swo_traceclk, ST.swo_baud))
@@ -220,6 +221,14 @@ class Ocd {
             this.pending.set(this.seq, (rc, body) => {
                 clearTimeout(timer);
                 if (rc === BIN.ERR) {
+                    /* 连续命令级失败 = target 链路卡死：裸发一帧 REPROBE
+                     * （不等应答、不递归 xchg），恢复后无需人工干预 */
+                    if (++this.eioStreak >= 5) {
+                        this.eioStreak = 0;
+                        const rh = Buffer.alloc(4);
+                        rh[0] = 0; rh[1] = BIN.REPROBE; rh.writeUInt16LE(0, 2);
+                        if (this.sock) this.sock.write(rh);
+                    }
                     reject(new Error(body.toString()));
                 } else {
                     this.eioStreak = 0;
@@ -579,6 +588,7 @@ async function swoLoop() {
             ST.swo_state = `connecting (${++ST.swo_conn_n})`;
             await new Promise((resolve, reject) => {
                 const sock = net.connect(SWO_PORT, ip, () => {
+                    sock.setKeepAlive(true, 5000);
                     ST.swo_ok = true; ST.swo_state = "reading";
                     ST.swo_last_rx = Date.now();
                     resolve();
@@ -788,7 +798,10 @@ function apiExcstats() {
 }
 
 function apiEvents() {
-    const cutoffGtc = ST.gtc - 60 * GTC_HZ;
+    /* 以最近事件时刻为 60s 窗口基准（对齐 py）：事件停更后画面保留最后
+     * 60s，而不是按当前 GTC 全部裁掉 */
+    const lastGtc = ST.events.length ? ST.events[ST.events.length - 1].gtc : ST.gtc;
+    const cutoffGtc = lastGtc - 60 * GTC_HZ;
     const evs = ST.events.filter(e => e.gtc >= cutoffGtc).map(e => ({
         ms: Math.round(e.gtc / (GTC_HZ / 1000) * 1000) / 1000,
         src: "evt", type: e.type, arg: e.arg,
@@ -1072,10 +1085,14 @@ async function handleWsMessage(sess, msg) {
                 f[0] <= addr && addr < (f[1] || f[0] + 0x100));
             if (!fn) { reply({ func: null, rows: d.rows.slice(0, 200) }); return; }
             const start = fn[0], end = fn[1] || fn[0] + 0x100;
-            const rows = d.rows.filter(r =>
-                r[0] === "f" ? true :
-                r[0] === "s" ? true :
-                r[1] >= start && r[1] < end);
+            /* 与 Python 版 disasm_window 同构：f 行作函数边界，只收目标
+             * 函数段内的行（全文件混入会串函数/串源码） */
+            const rows = [];
+            let inwin = false, cnt = 0;
+            for (const r of d.rows) {
+                if (r[0] === "f") { inwin = (r[1] === fn[2] && r[2] === fn[0]); continue; }
+                if (inwin) { rows.push(r); if (++cnt >= 3000) break; }
+            }
             reply({ func: { a: "0x" + fn[0].toString(16), n: fn[2], sz: end - fn[0] },
                     rows });
         }
@@ -1767,7 +1784,7 @@ function wsConnect(){
   ws.onmessage=e=>{const m=JSON.parse(e.data);
     if(m.id&&wsPend[m.id]){wsPend[m.id](m);delete wsPend[m.id];return;}
     if(m.t==="push")handlePush(m);
-    else if(m.t==="con"){con.textContent+=m.s;
+    else if(m.t==="con"){con.textContent=(con.textContent+m.s).slice(-400000);
       if($("autoscroll").checked)con.scrollTop=con.scrollHeight;}};
   ws.onclose=()=>{setTimeout(wsConnect,1000);};}
 function wsSend(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
@@ -2364,10 +2381,11 @@ function renderWatch(s){
     const tb=$("w_tbl").querySelector("tbody");
     tb.innerHTML=s.watches.map((w,i)=>{
       const[lo,hi]=wRange(w);
-      const fsel=["u32","i32","hex","u16","i16","u8","i8","f32"].map(f=>
+      const fsel=["u32","i32","hex","u16","i16","u8","i8","f32","u64","i64","f64"].map(f=>
         \`<option\${f===w.fmt?" selected":""}>\${f}</option>\`).join("");
       const wsel=[1,2,3,4].map(k=>
-        \`<option value="\${k}"\${(w.win??1)===k?" selected":""}>窗\${k}</option>\`).join("");
+        \`<option value="\${k}"\${(w.win??1)===k?" selected":""}>窗\${k}</option>\`).join("")+
+        \`<option value="0"\${(w.win||0)===0?" selected":""}>不显示</option>\`;
       return \`<tr id="wr\${i}"><td><span style="color:\${DCOLORS[i%8]}">■</span></td><td>\${esc(w.name)}</td>
       <td class="mono">\${w.addr}</td><td><select style="width:58px" onchange="wFmtSet('\${esc(w.name)}',this.value)">\${fsel}</select></td>
       <td><select style="width:56px" onchange="wWinSet('\${esc(w.name)}',this.value)">\${wsel}</select></td><td class="mono cur">—</td>
@@ -2766,7 +2784,7 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
             if (p === "/api/cmd") {
-                json(res, { out: (await OCD.cmd(String(body.cmd || "").slice(0, 200))).slice(-2000) });
+                json(res, { out: (await OCD.cmd(String(body.cmd || "").slice(0, 200))).slice(-16000) });
                 return;
             }
             if (p === "/api/swocfg") {
@@ -2795,7 +2813,7 @@ const server = http.createServer(async (req, res) => {
                 } else {
                     json(res, { watches: ST.watches.map(w => ({
                         name: w.name, addr: "0x" + w.addr.toString(16), size: w.size, fmt: w.fmt, win: w.win || 1,
-                        series: w.series.slice(-600).map(([t, v]) => [Math.round(t * 1000) / 1000, v]) })) });
+                        series: w.series.slice(-600).map(([t, v]) => [Math.round(t * 1000) / 1000, wPushVal(w, v)]) })) });
                 }
                 return;
             }
@@ -2880,7 +2898,14 @@ async function main() {
     swoLoop().catch(console.error);
     withRetry(tgtLoop, 250).catch(console.error);
     withRetry(dwtLoop, 250).catch(console.error);
-    setInterval(() => watchLoop().catch(() => {}), ST.watch_ms);
+    /* 递归 setTimeout 而非 setInterval：采样周期改动（/api/watch rate）
+     * 才能动态生效（setInterval 间隔在启动时固化） */
+    (async function watchTick() {
+        while (true) {
+            await watchLoop().catch(() => {});
+            await new Promise(r => setTimeout(r, Math.max(50, ST.watch_ms)));
+        }
+    })();
     vrefLoop().catch(() => {});
 
     server.listen(PORT, "0.0.0.0", () => {
