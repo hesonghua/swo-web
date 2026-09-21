@@ -3403,7 +3403,7 @@ function drawGauge(s){
   x.lineTo(cx+Math.cos(na)*(R+7),cy+Math.sin(na)*(R+7));x.stroke();
   x.textAlign="center";
   x.fillStyle=cvc("#e8eef4","#22303d");x.font="600 15px monospace";
-  x.fillText(cur==null?"—":wStr(w,cur),cx,cy+6);
+  x.fillText(raw==null?"—":wStr(w,raw),cx,cy+6);  /* 显示传 raw（wStr 内部单次解码；传 cur 会双重解码，f32 负数 ToInt32 截成 0）*/
   x.font="10.5px monospace";x.fillStyle=cvc("#8fa0b0","#4a5c6e");
   x.fillText(w.name.slice(0,24),cx,cy+R+14);
   x.fillStyle=cvc("#5b6b7c","#66778a");
@@ -3423,7 +3423,7 @@ function drawBits(s){
   x.font="11px monospace";x.fillStyle=DCOLORS[i%8];
   x.fillText(w.name.slice(0,20),8,y+13);
   x.fillStyle=cvc("#8fa0b0","#4a5c6e");x.font="11px monospace";
-  x.fillText(cur==null?"—":wStr(w,cur),8,y+32);
+  x.fillText(raw==null?"—":wStr(w,raw),8,y+32);  /* 同 drawGauge：传 raw 防双重解码 */
   for(let b=0;b<n;b++){
    const bx=W-12-(n-b)*bw;
    const lit=bits!=null&&((bits>>BigInt(b))&1n);  /* 原始位模式（64 位走 BigInt）*/

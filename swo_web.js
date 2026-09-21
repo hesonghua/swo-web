@@ -2556,7 +2556,8 @@ function drawGauge(s){
   const col=i%cols,row=(i/cols)|0;
   const cw=W/cols,cx=col*cw+cw/2,cy=row*170+85,R=Math.min(cw/2,170/2)-24;
   const[lo,hi]=wRange(w);
-  const cur=w.series.length?wNum(w,w.series[w.series.length-1][1]):null;
+  const raw=w.series.length?w.series[w.series.length-1][1]:null;  /* 原始值 */
+  const cur=raw!=null?wNum(w,raw):null;
   const frac=cur==null?0:Math.max(0,Math.min(1,(cur-lo)/(hi-lo||1)));
   const a0=Math.PI*0.75,a1=Math.PI*2.25,na=a0+(a1-a0)*frac;
   x.strokeStyle=cvc("#232e3b","#c8d3dd");x.lineWidth=8;
@@ -2569,7 +2570,7 @@ function drawGauge(s){
   x.lineTo(cx+Math.cos(na)*(R+7),cy+Math.sin(na)*(R+7));x.stroke();
   x.textAlign="center";
   x.fillStyle=cvc("#e8eef4","#22303d");x.font="600 15px monospace";
-  x.fillText(cur==null?"—":wStr(w,cur),cx,cy+6);
+  x.fillText(raw==null?"—":wStr(w,raw),cx,cy+6);  /* 显示传 raw（wStr 内部单次解码；传 cur 会双重解码，f32 负数 ToInt32 截成 0）*/
   x.font="10.5px monospace";x.fillStyle=cvc("#8fa0b0","#4a5c6e");
   x.fillText(w.name.slice(0,24),cx,cy+R+14);
   x.fillStyle=cvc("#5b6b7c","#66778a");
@@ -2589,7 +2590,7 @@ function drawBits(s){
   x.font="11px monospace";x.fillStyle=DCOLORS[i%8];
   x.fillText(w.name.slice(0,20),8,y+13);
   x.fillStyle=cvc("#8fa0b0","#4a5c6e");x.font="11px monospace";
-  x.fillText(cur==null?"—":wStr(w,cur),8,y+32);
+  x.fillText(raw==null?"—":wStr(w,raw),8,y+32);  /* 同 drawGauge：传 raw 防双重解码 */
   for(let b=0;b<n;b++){
    const bx=W-12-(n-b)*bw;
    const lit=bits!=null&&((bits>>BigInt(b))&1n);  /* 原始位模式（64 位走 BigInt）*/
