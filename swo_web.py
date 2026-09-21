@@ -36,6 +36,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 import shutil
 import signal
 import socket
@@ -894,6 +895,19 @@ def disasm_window(d, addr=None, name=None):
 
 
 # ---------------------------------------------------------------- 变量 watch
+def w_push_val(w, v):
+    """series 值的 JSON 编码：64 位原始位模式走 JSON number 会超 2^53 丢精度。
+    f64 直接推 IEEE754 真值（JSON double 序列化精确往返）；u64/i64 大数推
+    字符串（前端 BigInt 解析）。32 位内原样。"""
+    if v is None:
+        return None
+    if w["fmt"] == "f64" and w["size"] == 8:
+        return struct.unpack("<d", struct.pack("<Q", v))[0]
+    if w["size"] == 8 and v > (1 << 53):
+        return str(v)
+    return v
+
+
 def watch_setfmt(name, fmt):
     """行内改格式：只换解释（f32/i32/hex 互换不动提取）；u16/u8 连子字
     提取宽度一起换。"""
@@ -903,7 +917,8 @@ def watch_setfmt(name, fmt):
     for w in ST.watches:
         if w["name"] == name:
             w["fmt"] = fmt
-            w["size"] = {"u16": 2, "i16": 2, "u8": 1, "i8": 1}.get(fmt, 4)
+            w["size"] = {"u16": 2, "i16": 2, "u8": 1, "i8": 1,
+                         "u64": 8, "i64": 8, "f64": 8}.get(fmt, 4)
             return True, ""
     return False, f"未找到: {name}"
 
@@ -960,13 +975,15 @@ async def watch_loop():
                 ws = sorted(ST.watches, key=lambda w: w["addr"])
                 segs = []
                 for w in ws:
-                    b = w["addr"] & ~3
+                    # 8 字节变量从 8 对齐基址起覆盖两个 32 位字（合并高低字用）
+                    b = (w["addr"] & ~7) if w["size"] == 8 else (w["addr"] & ~3)
+                    nw = 2 if w["size"] == 8 else 1
                     if segs and b < segs[-1][0] + segs[-1][1] * 4 + 64:
-                        need = (b + 4 - segs[-1][0]) // 4
+                        need = (b + 4 * nw - segs[-1][0]) // 4
                         if need > segs[-1][1]:
                             segs[-1][1] = need
                     else:
-                        segs.append([b, 1])
+                        segs.append([b, nw])
                 words, now = {}, time.time()
                 for b, n in segs:
                     try:
@@ -1287,11 +1304,11 @@ async def ws_pusher(sess):
                         ser = w["series"]
                         lag = n_abs - sent
                         if full or lag > len(ser) or lag < 0:
-                            pts = [[round(t, 3), v]
+                            pts = [[round(t, 3), w_push_val(w, v)]
                                    for t, v in ser]
                             full_w = True
                         else:
-                            pts = [[round(t, 3), v]
+                            pts = [[round(t, 3), w_push_val(w, v)]
                                    for t, v in list(ser)[len(ser) - lag:]] \
                                 if lag else []
                             full_w = False
@@ -1779,7 +1796,8 @@ async def handle_http(reader, writer):
                     {"name": w["name"], "addr": f"0x{w['addr']:08x}",
                      "size": w["size"], "fmt": w["fmt"],
                      "win": w.get("win", 1),
-                     "series": [[round(t, 3), v] for t, v in w["series"]]}
+                     "series": [[round(t, 3), w_push_val(w, v)]
+                                for t, v in w["series"]]}
                     for w in ST.watches]})
             elif p == "/api/dwt":
                 json_resp(writer, {
@@ -3051,10 +3069,15 @@ function wNum(w,v){             // 原始 u 值 -> 按 fmt 的数值
     case"u8":return (v>>>0)&0xFF;
     case"i8":{const x=v&0xFF;return x>=0x80?x-0x100:x;}
     case"f32":_f32u[0]=v>>>0;return _f32f[0];
-    case"u64":return Number(v);        /* JS Number 精确到 2^53 够用 */
-    case"i64":return v>0x7FFFFFFFFFFFFF?v-0x10000000000000000:Number(v);
-    case"f64":_f64u[0]=v&0xFFFFFFFF;_f64u[1]=Math.floor(v/0x100000000);return _f64f[0];
+    case"u64":return Number(BigInt(v));          /* v 可能是字符串(>2^53 保真) */
+    case"i64":{const g=BigInt(v);return Number(g>0x7FFFFFFFFFFFFFFFn?g-0x10000000000000000n:g);}
+    case"f64":return v;                           /* 后端已推 IEEE754 真值 */
     default:return v>>>0;}}
+function wRawBits(w,raw){  /* 任意 fmt 原始值 -> BigInt 位模式（位视图用） */
+  if(raw==null)return null;
+  if(w.size<8)return BigInt(raw>>>0);
+  if(w.fmt==="f64"){_f64f[0]=raw;return (BigInt(_f64u[1])<<32n)|BigInt(_f64u[0]);}
+  return BigInt(raw);}
 function wStr(w,v){const x=wNum(w,v);return x==null?"—":
   w.fmt==="f32"?x.toFixed(4):w.fmt==="f64"?x.toFixed(6):
       w.fmt==="hex"?"0x"+x.toString(16):String(x);}
@@ -3367,8 +3390,9 @@ function drawBits(s){
  const[cv,x,W,H]=wCanvas(ws.length*46+14);
  ws.forEach((w,i)=>{
   const y=14+i*46,n=w.size*8;
-  const raw=w.series.length?w.series[w.series.length-1][1]:null;  /* 原始位 */
+  const raw=w.series.length?w.series[w.series.length-1][1]:null;  /* 原始值 */
   const cur=raw!=null?wNum(w,raw):null;
+  const bits=wRawBits(w,raw);
   const bw=Math.max(8,Math.min(30,Math.floor((W-240)/n)));
   x.font="11px monospace";x.fillStyle=DCOLORS[i%8];
   x.fillText(w.name.slice(0,20),8,y+13);
@@ -3376,7 +3400,7 @@ function drawBits(s){
   x.fillText(cur==null?"—":wStr(w,cur),8,y+32);
   for(let b=0;b<n;b++){
    const bx=W-12-(n-b)*bw;
-   const lit=raw!=null&&((raw>>>b)&1);  /* IEEE754 原始位（不是数值的位）*/
+   const lit=bits!=null&&((bits>>BigInt(b))&1n);  /* 原始位模式（64 位走 BigInt）*/
    x.fillStyle=lit?DCOLORS[i%8]:cvc("#232e3b","#c8d3dd");
    x.fillRect(bx,y,bw-3,18);
    if(b%8===7){x.fillStyle=cvc("#5b6b7c","#66778a");x.font="9px monospace";

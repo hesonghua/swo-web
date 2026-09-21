@@ -33,6 +33,20 @@ const SWO_PINFREQ = 8000000;
 const GTC_HZ = 72000000;
 const DWT_CTRL_ADDR = 0xE0001000;
 const PCSAMPLENA = 1 << 12, EXCTRCENA = 1 << 16, CYCCNTENA = 1 << 0;
+const WATCH_SIZE_MAP = { u16: 2, i16: 2, u8: 1, i8: 1, u64: 8, i64: 8, f64: 8 };
+
+/* series 64 位原始值的 JSON 编码：number 超 2^53 丢精度。f64 推 IEEE754
+ * 真值（JSON double 精确往返）；u64/i64 大数推字符串（前端 BigInt 解析）。 */
+function wPushVal(w, v) {
+    if (v == null || v === undefined) return null;
+    if (typeof v === "bigint") {
+        if (w.fmt === "f64")
+            return new Float64Array(new BigUint64Array([v]).buffer)[0];
+        if (v > (1n << 53n)) return v.toString();
+        return Number(v);
+    }
+    return v;
+}
 
 const ELF_CANDIDATES = [
     path.join(__dirname, "..", "swotest", "swotest.elf"),
@@ -625,12 +639,14 @@ async function watchLoop() {
     const ws = [...ST.watches].sort((a, b) => a.addr - b.addr);
     const segs = [];
     for (const w of ws) {
-        const b = w.addr & ~3;
+        /* 8 字节变量从 8 对齐基址起覆盖两个 32 位字（合并高低字用） */
+        const b = (w.size === 8) ? (w.addr & ~7) : (w.addr & ~3);
+        const nw = (w.size === 8) ? 2 : 1;
         if (segs.length && b < segs[segs.length-1][0] + segs[segs.length-1][1] * 4 + 64) {
-            const need = Math.ceil((b + 4 - segs[segs.length-1][0]) / 4);
+            const need = Math.ceil((b + 4 * nw - segs[segs.length-1][0]) / 4);
             if (need > segs[segs.length-1][1]) segs[segs.length-1][1] = need;
         } else {
-            segs.push([b, 1]);
+            segs.push([b, nw]);
         }
     }
     const words = new Map();
@@ -642,9 +658,17 @@ async function watchLoop() {
     }
     const now = Date.now() / 1000;
     for (const w of ST.watches) {
-        let word = words.get(w.addr & ~3);
-        if (word !== undefined && w.size < 4) {
-            word = (word >> ((w.addr & 3) * 8)) & ((1 << (w.size * 8)) - 1);
+        let word;
+        if (w.size === 8) {
+            /* 合并两个相邻 32 位字（小端低字在前）；BigInt 防超 2^53 丢精度 */
+            const base = w.addr & ~7;
+            const lo = words.get(base) || 0, hi = words.get(base + 4) || 0;
+            word = (BigInt(hi >>> 0) << 32n) | BigInt(lo >>> 0);
+        } else {
+            word = words.get(w.addr & ~3);
+            if (word !== undefined && w.size < 4) {
+                word = (word >>> ((w.addr & 3) * 8)) & ((1 << (w.size * 8)) - 1);
+            }
         }
         w.series.push([now, word]);
         if (w.series.length > 600) w.series.shift();
@@ -840,11 +864,11 @@ async function wsSession(req, socket) {
                     const lag = nAbs - sent;
                     let pts, fullW;
                     if (full || lag > w.series.length || lag < 0) {
-                        pts = w.series.map(([t, v]) => [Math.round(t * 1000) / 1000, v]);
+                        pts = w.series.map(([t, v]) => [Math.round(t * 1000) / 1000, wPushVal(w, v)]);
                         fullW = true;
                     } else {
                         pts = lag > 0 ?
-                            w.series.slice(-lag).map(([t, v]) => [Math.round(t * 1000) / 1000, v]) : [];
+                            w.series.slice(-lag).map(([t, v]) => [Math.round(t * 1000) / 1000, wPushVal(w, v)]) : [];
                         fullW = false;
                     }
                     cur.sent.set(w.name, nAbs);
@@ -962,11 +986,14 @@ async function handleWsMessage(sess, msg) {
             const name = String(msg.name || "").trim();
             if (act === "add") {
                 let addr = null, size = 4, disp = name;
+                const fmt = String(msg.fmt || "u32");
                 const ent = ST.sym_by_name.get(name);
-                if (ent) { addr = ent[0]; size = ent[1]; if (size > 4) size = 4; }
+                if (ent) { addr = ent[0]; size = ent[1]; }
                 else { addr = parseInt(name); if (isNaN(addr)) { reply({ error: "符号未找到" }); return; } }
+                if (fmt in WATCH_SIZE_MAP) size = WATCH_SIZE_MAP[fmt];
+                else if (size > 8) size = 8;
                 if (!ST.watches.find(w => w.addr === addr && w.name === disp)) {
-                    ST.watches.push({ name: disp, addr, size, fmt: msg.fmt || "u32",
+                    ST.watches.push({ name: disp, addr, size, fmt,
                         win: parseInt(msg.win) || 1, series: [], n: 0 });
                 }
                 reply({ ok: true });
@@ -980,7 +1007,8 @@ async function handleWsMessage(sess, msg) {
                 reply({ watch_ms: ST.watch_ms });
             } else if (act === "setfmt") {
                 const w = ST.watches.find(w => w.name === name);
-                if (w) { w.fmt = msg.fmt || "u32"; reply({ ok: true }); }
+                if (w) { w.fmt = String(msg.fmt || "u32");
+                         w.size = WATCH_SIZE_MAP[w.fmt] || 4; reply({ ok: true }); }
                 else reply({ error: "未找到" });
             } else if (act === "setwin") {
                 const w = ST.watches.find(w => w.name === name);
@@ -1592,7 +1620,9 @@ color:var(--dim);flex:none;white-space:nowrap;overflow:hidden}
   <select id="wfmt"><option value="u32">u32</option><option value="i32">i32</option>
    <option value="hex">hex</option><option value="u16">u16</option>
    <option value="i16">i16</option><option value="u8">u8</option>
-   <option value="i8">i8</option><option value="f32">f32</option></select>
+   <option value="i8">i8</option><option value="f32">f32</option>
+   <option value="u64">u64</option><option value="i64">i64</option>
+   <option value="f64">f64</option></select>
   <button class="tbtn" onclick="watchAdd()">添加</button>
   <button class="tbtn warn" onclick="watchClr()">清空</button>
   <span class="hint" id="winfo"></span>
@@ -2203,6 +2233,7 @@ let wModeV="line",wPaused=false;
 const wTrig={on:false,fired:false,var:"",cmp:">",v:0,t0:0};
 let _wsig="";
 const _f32b=new ArrayBuffer(4),_f32u=new Uint32Array(_f32b),_f32f=new Float32Array(_f32b);
+const _f64b=new ArrayBuffer(8),_f64u=new Uint32Array(_f64b),_f64f=new Float64Array(_f64b);
 function wNum(w,v){             // 原始 u 值 -> 按 fmt 的数值
   if(v==null)return null;
   switch(w.fmt){
@@ -2212,9 +2243,18 @@ function wNum(w,v){             // 原始 u 值 -> 按 fmt 的数值
     case"u8":return (v>>>0)&0xFF;
     case"i8":{const x=v&0xFF;return x>=0x80?x-0x100:x;}
     case"f32":_f32u[0]=v>>>0;return _f32f[0];
+    case"u64":return Number(BigInt(v));          /* v 可能是字符串(>2^53 保真) */
+    case"i64":{const g=BigInt(v);return Number(g>0x7FFFFFFFFFFFFFFFn?g-0x10000000000000000n:g);}
+    case"f64":return v;                           /* 后端已推 IEEE754 真值 */
     default:return v>>>0;}}
+function wRawBits(w,raw){  /* 任意 fmt 原始值 -> BigInt 位模式（位视图用） */
+  if(raw==null)return null;
+  if(w.size<8)return BigInt(raw>>>0);
+  if(w.fmt==="f64"){_f64f[0]=raw;return (BigInt(_f64u[1])<<32n)|BigInt(_f64u[0]);}
+  return BigInt(raw);}
 function wStr(w,v){const x=wNum(w,v);return x==null?"—":
-  w.fmt==="f32"?x.toFixed(4):w.fmt==="hex"?"0x"+x.toString(16):String(x);}
+  w.fmt==="f32"?x.toFixed(4):w.fmt==="f64"?x.toFixed(6):
+      w.fmt==="hex"?"0x"+x.toString(16):String(x);}
 async function watchAdd(){
  const n=$("wname").value.trim();if(!n)return;
  const r=await post("/api/watch",{action:"add",name:n,fmt:$("wfmt").value});
@@ -2521,7 +2561,9 @@ function drawBits(s){
  const[cv,x,W,H]=wCanvas(ws.length*46+14);
  ws.forEach((w,i)=>{
   const y=14+i*46,n=w.size*8;
-  const cur=w.series.length?wNum(w,w.series[w.series.length-1][1]):null;
+  const raw=w.series.length?w.series[w.series.length-1][1]:null;  /* 原始值 */
+  const cur=raw!=null?wNum(w,raw):null;
+  const bits=wRawBits(w,raw);
   const bw=Math.max(8,Math.min(30,Math.floor((W-240)/n)));
   x.font="11px monospace";x.fillStyle=DCOLORS[i%8];
   x.fillText(w.name.slice(0,20),8,y+13);
@@ -2529,7 +2571,7 @@ function drawBits(s){
   x.fillText(cur==null?"—":wStr(w,cur),8,y+32);
   for(let b=0;b<n;b++){
    const bx=W-12-(n-b)*bw;
-   const lit=cur!=null&&((cur>>>b)&1);
+   const lit=bits!=null&&((bits>>BigInt(b))&1n);  /* 原始位模式（64 位走 BigInt）*/
    x.fillStyle=lit?DCOLORS[i%8]:cvc("#232e3b","#c8d3dd");
    x.fillRect(bx,y,bw-3,18);
    if(b%8===7){x.fillStyle=cvc("#5b6b7c","#66778a");x.font="9px monospace";
@@ -2781,7 +2823,7 @@ const server = http.createServer(async (req, res) => {
                 json(res, { watches: ST.watches.map(w => ({
                     name: w.name, addr: "0x" + w.addr.toString(16).padStart(8, "0"),
                     size: w.size, fmt: w.fmt, win: w.win || 1,
-                    series: w.series.map(([t, v]) => [Math.round(t * 1000) / 1000, v]) })) });
+                    series: w.series.map(([t, v]) => [Math.round(t * 1000) / 1000, wPushVal(w, v)]) })) });
                 return;
             }
         }
