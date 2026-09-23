@@ -502,6 +502,7 @@ BIN_PING, BIN_CMD, BIN_HALTINFO, BIN_HALT, BIN_RESUME, BIN_STEP = 1, 2, 3, 4, 5,
 BIN_REG_RD, BIN_REG_WR, BIN_MEM_RD, BIN_MEM_WR = 7, 8, 9, 0xA
 BIN_BP_ADD, BIN_BP_DEL, BIN_WP_ADD, BIN_WP_DEL, BIN_BPS = 0xB, 0xC, 0xD, 0xE, 0xF
 BIN_SWO_TPIU, BIN_SWO_STAT, BIN_REPROBE, BIN_VREF = 0x10, 0x11, 0x12, 0x13
+BIN_LA_ARM, BIN_LA_STAT, BIN_LA_DUMP = 0x14, 0x15, 0x16
 BIN_ERR = 0x7F
 # 寄存器 sel 序（r0-r12, sp, lr, pc, xpsr, msp, psp, primask, basepri, faultmask, control）
 REG_SELS = bytes([*range(13), 13, 14, 15, 0x10, 0x11, 0x12, 0x14, 0x15, 0x16, 0x17])
@@ -708,6 +709,28 @@ class Ocd:
         except Exception:
             pass
         return None
+
+    async def la_arm(self, div, post, mode, val, mask):
+        """LA 武装：一次下发全配置并 arm（预触发环采开始）。"""
+        await self._xchg(BIN_LA_ARM, struct.pack(
+            "<HHBHH", int(div) & 0xFFFF, int(post) & 0xFFFF,
+            1 if mode else 0, int(val) & 0xFFF, int(mask) & 0xFFF))
+
+    async def la_stat(self):
+        """-> (armed, fired, done, wr_cnt)。"""
+        b = await self._xchg(BIN_LA_STAT)
+        s = int.from_bytes(b[:4], "little")
+        return (bool(s & 1), bool(s & 2), bool(s & 4), s >> 16)
+
+    async def la_dump(self, n):
+        """-> (samples[12bit], (armed,fired,done,wr))：触发对齐时间序，
+        样本 0 = 触发样本（未触发时从最老样本起）。"""
+        b = await self._xchg(BIN_LA_DUMP, struct.pack("<H", int(n)), 30.0)
+        ns = (len(b) - 4) // 2
+        samples = [b[i * 2] | ((b[i * 2 + 1] & 0x0F) << 8)
+                   for i in range(ns)]
+        s = int.from_bytes(b[ns * 2:ns * 2 + 4], "little")
+        return samples, (bool(s & 1), bool(s & 2), bool(s & 4), s >> 16)
 
     async def set_trace(self, pc=None, exc=None):
         v = CYCCNTENA
@@ -2063,6 +2086,29 @@ async def handle_http(reader, writer):
             elif p == "/api/eventport":
                 ST.event_port = max(0, min(31, int(body.get("port", 2))))
                 json_resp(writer, {"event_port": ST.event_port})
+            elif p == "/api/la":
+                act = body.get("action", "")
+                try:
+                    if act == "arm":
+                        await OCD.la_arm(
+                            body.get("div", 124), body.get("post", 2047),
+                            body.get("mode", 0), body.get("val", 0),
+                            body.get("mask", 0xFFF))
+                        json_resp(writer, {"ok": True})
+                    elif act == "stat":
+                        a, f, d, w = await OCD.la_stat()
+                        json_resp(writer, {"armed": a, "fired": f,
+                                           "done": d, "wr": w})
+                    elif act == "dump":
+                        n = max(1, min(4096, int(body.get("n", 4096))))
+                        samples, st = await OCD.la_dump(n)
+                        json_resp(writer, {"samples": samples,
+                                           "armed": st[0], "fired": st[1],
+                                           "done": st[2], "wr": st[3]})
+                    else:
+                        json_resp(writer, {"error": "bad action"}, 400)
+                except Exception as e:
+                    json_resp(writer, {"error": repr(e)}, 500)
             elif p == "/api/swocfg":
                 tc = int(body.get("traceclk", 72000000) or 72000000)
                 tc = max(1_000_000, min(300_000_000, tc))
@@ -2379,6 +2425,7 @@ color:var(--dim);flex:none;white-space:nowrap;overflow:hidden}
  <button data-t="dwt">性能计数</button>
  <button data-t="debug">调试</button>
  <button data-t="watch">变量</button>
+ <button data-t="la">LA</button>
  <button data-t="target">目标</button>
 </div>
 
@@ -2622,6 +2669,35 @@ color:var(--dim);flex:none;white-space:nowrap;overflow:hidden}
   <tbody></tbody></table></div>
  <div class="hint">· mdw 轮询（运行/停止都采，停止时值冻结为平线）；u16/u8 为子字提取，f32 按 IEEE754 重解释；watch 列表存 localStorage，换 ELF 自动按名字重解析；
    触发=阈值单次：命中后画面冻结在触发瞬间，重新武装继续</div>
+</section>
+
+<!-- ============ 逻辑分析器（12 路） ============ -->
+<section id="s-la">
+ <div class="row" style="gap:8px;flex-wrap:wrap;align-items:center">
+  <b style="font-size:12px">LA</b>
+  采样 <select id="la_div">
+   <option value="0">125 MHz</option><option value="1">62.5 MHz</option>
+   <option value="3">31.25 MHz</option><option value="4">25 MHz</option>
+   <option value="11">10.4 MHz</option><option value="24">5 MHz</option>
+   <option value="49">2.5 MHz</option><option value="124" selected>1 MHz</option>
+   <option value="249">500 kHz</option><option value="499">250 kHz</option>
+   <option value="1249">100 kHz</option><option value="4999">25 kHz</option>
+   <option value="12499">10 kHz</option><option value="49999">2.5 kHz</option>
+  </select>
+  触发后 <input type="text" class="sm" id="la_post" value="2047" style="width:64px" title="触发后再采样本数-1（预触发=4096-此值）"> 样
+  <select id="la_mode"><option value="0">码型触发</option><option value="1">边沿触发</option></select>
+  值 <input type="text" class="sm" id="la_val" value="0x000" style="width:56px">
+  掩码 <input type="text" class="sm" id="la_mask" value="0xFFF" style="width:56px">
+  <button class="tbtn" onclick="laArm()">▶ 武装</button>
+  <button class="tbtn" onclick="laStop()">■ 停止</button>
+  <button class="tbtn" onclick="laOne()">单次捕获</button>
+  <span id="la_stat" style="color:#8fa0b0">—</span>
+ </div>
+ <canvas id="la_cv" style="width:100%;height:420px"></canvas>
+ <div id="la_info" style="color:#5b6b7c;font-size:11.5px">
+  12 路 = la_in[0..11]（原 gpio_rtl_0_tri_io[5..16]：A20 H16 B19 B20 C20 H17 D20 D18 H18 D19 F20 E19）。
+  码型触发：(pin &amp; mask) == (val &amp; mask)；边沿触发：任一通道相对上一采样拍变化。
+ </div>
 </section>
 
 <!-- ============ 目标 ============ -->
@@ -3599,6 +3675,65 @@ function wHoverRender(){
    if(r&&r.syms){
      const objs=r.syms.filter(q=>q.t==="O").map(q=>q.n);
      $("wl_syms").innerHTML=objs.map(n=>`<option value="${esc(n)}">`).join("");}});}
+/* ================= LA 逻辑分析器（12 路） ================= */
+let laPollT=null, laSamples=null;
+async function laArm(){
+  const r=await post("/api/la",{action:"arm",
+    div:parseInt($("la_div").value)||0,post:parseInt($("la_post").value)||2047,
+    mode:parseInt($("la_mode").value)||0,
+    val:parseInt($("la_val").value||"0",0)||0,
+    mask:parseInt($("la_mask").value||"0xFFF",0)});
+  $("la_stat").textContent=r.error?r.error:"武装中…";
+  $("la_stat").style.color=r.error?"#e05d5d":"#8fa0b0";
+  if(!r.error&&laPollT===null)laPollT=setInterval(laPoll,400);
+}
+async function laStop(){
+  await post("/api/la",{action:"stop"});
+  if(laPollT){clearInterval(laPollT);laPollT=null;}
+  $("la_stat").textContent="已停止";
+}
+async function laPoll(){
+  try{
+    const s=await post("/api/la",{action:"stat"});
+    if(s.error)return;
+    $("la_stat").textContent=
+      (s.done?"已采满 ":(s.fired?"已触发，采样中 ":(s.armed?"等待触发 ":"— ")))
+      +`（${s.wr} 样本）`;
+    if(s.done){if(laPollT){clearInterval(laPollT);laPollT=null;}laDump();}
+  }catch(e){}
+}
+async function laDump(){
+  const r=await post("/api/la",{action:"dump",n:4096});
+  if(r.error){$("la_stat").textContent=r.error;return;}
+  laSamples=r.samples;drawLa();
+}
+function drawLa(){
+  const cv=$("la_cv"),W=cv.clientWidth||900,H=420;
+  if(cv.width!==W*2||cv.height!==H*2){cv.width=W*2;cv.height=H*2;}
+  const x=cv.getContext("2d");x.setTransform(2,0,0,2,0,0);x.clearRect(0,0,W,H);
+  const s=laSamples||[];
+  if(!s.length){x.fillStyle=cvc("#5b6b7c","#66778a");x.font="12px monospace";
+    x.fillText("武装并触发后此处显示 12 通道波形（样本 0 = 触发点）",14,24);return;}
+  const lab=70,n=s.length,sw=W-lab-10,rowH=H/12;
+  for(let ch=11;ch>=0;ch--){
+    const y0=(11-ch)*rowH,hi=y0+5,lo=y0+rowH-5;
+    x.fillStyle=cvc("#141d28","#eef2f6");x.fillRect(lab,y0,sw,rowH);
+    x.fillStyle=cvc("#8fa0b0","#4a5c6e");x.font="10.5px monospace";
+    x.fillText("la_in["+ch+"]",6,y0+rowH*0.6);
+    x.strokeStyle=DCOLORS[ch%8];x.lineWidth=1.6;x.beginPath();
+    let prev=null;
+    for(let i=0;i<n;i++){
+      const v=(s[i]>>ch)&1,px=lab+i/n*sw,py=v?hi:lo;
+      if(prev===null)x.moveTo(px,py);
+      else{x.lineTo(px,prev?hi:lo);x.lineTo(px,py);}
+      prev=v;
+    }
+    x.stroke();
+  }
+  x.strokeStyle="#e05d5d";x.setLineDash([4,3]);
+  x.beginPath();x.moveTo(lab,0);x.lineTo(lab,H);x.stroke();x.setLineDash([]);
+  x.fillStyle="#e05d5d";x.font="10px monospace";x.fillText("触发",lab+4,12);
+}
 /* ================= 时间线（异常 + ITM 事件归并） ================= */
 function renderTl2(s){
  try{
