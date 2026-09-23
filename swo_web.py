@@ -720,7 +720,8 @@ class Ocd:
         """-> (armed, fired, done, wr_cnt)。"""
         b = await self._xchg(BIN_LA_STAT)
         s = int.from_bytes(b[:4], "little")
-        return (bool(s & 1), bool(s & 2), bool(s & 4), s >> 16)
+        # RTL 打包位段：wr_cnt 在 [24:12]（读 >>16 会错位成 cnt/16）
+        return (bool(s & 1), bool(s & 2), bool(s & 4), (s >> 12) & 0x1FFF)
 
     async def la_dump(self, n):
         """-> (samples[12bit], (armed,fired,done,wr))：触发对齐时间序，
@@ -730,7 +731,8 @@ class Ocd:
         samples = [b[i * 2] | ((b[i * 2 + 1] & 0x0F) << 8)
                    for i in range(ns)]
         s = int.from_bytes(b[ns * 2:ns * 2 + 4], "little")
-        return samples, (bool(s & 1), bool(s & 2), bool(s & 4), s >> 16)
+        return samples, (bool(s & 1), bool(s & 2), bool(s & 4),
+                         (s >> 12) & 0x1FFF)
 
     async def set_trace(self, pc=None, exc=None):
         v = CYCCNTENA
@@ -1455,6 +1457,24 @@ async def ws_dispatch(sess, m):
         port = max(0, min(31, int(m.get("v", 0))))
         buf = ST.text if port == 0 else ST.chan_text.get(port)
         reply({"t": "conback", "s": "".join(buf)[-16000:] if buf else ""})
+    elif t == "la":
+        # LA 逻辑分析器（ws 通道，与 HTTP /api/la 同逻辑）
+        act = m.get("action", "")
+        if act == "arm":
+            await OCD.la_arm(
+                m.get("div", 124), m.get("post", 2047),
+                m.get("mode", 0), m.get("val", 0), m.get("mask", 0xFFF))
+            reply({"ok": True})
+        elif act == "stat":
+            a, f, d, w = await OCD.la_stat()
+            reply({"armed": a, "fired": f, "done": d, "wr": w})
+        elif act == "dump":
+            n = max(1, min(4096, int(m.get("n", 4096) or 4096)))
+            samples, st = await OCD.la_dump(n)
+            reply({"samples": samples, "armed": st[0], "fired": st[1],
+                   "done": st[2], "wr": st[3]})
+        else:
+            reply({"error": "bad action"})
     elif t == "cmd":
         reply({"t": "resp", "out": (await OCD.cmd(
             str(m.get("line", ""))[:200], timeout=8.0)).strip()[-16000:]})
@@ -2685,7 +2705,7 @@ color:var(--dim);flex:none;white-space:nowrap;overflow:hidden}
    <option value="12499">10 kHz</option><option value="49999">2.5 kHz</option>
   </select>
   触发后 <input type="text" class="sm" id="la_post" value="2047" style="width:64px" title="触发后再采样本数-1（预触发=4096-此值）"> 样
-  <select id="la_mode"><option value="0">码型触发</option><option value="1">边沿触发</option></select>
+  <select id="la_mode"><option value="auto">自动（无触发）</option><option value="0">码型触发</option><option value="1">边沿触发</option></select>
   值 <input type="text" class="sm" id="la_val" value="0x000" style="width:56px">
   掩码 <input type="text" class="sm" id="la_mask" value="0xFFF" style="width:56px">
   <button class="tbtn" onclick="laArm()">▶ 武装</button>
@@ -2812,6 +2832,7 @@ async function post(u,o){
   else if(u==="/api/watch"){m.t="watch";}
   else if(u==="/api/eventport"){m.t="eventport";}
   else if(u==="/api/swocfg"){m.t="swocfg";}
+  else if(u==="/api/la"){m.t="la";}   /* action/div/post/mode/val/mask/n 随 {...o} 透传 */
   else{return {error:"no route "+u};}
   return wreq(m);}
 async function ctrl(pc,exc){const r=await post("/api/ctrl",{pc,exc});
@@ -3676,18 +3697,22 @@ function wHoverRender(){
      const objs=r.syms.filter(q=>q.t==="O").map(q=>q.n);
      $("wl_syms").innerHTML=objs.map(n=>`<option value="${esc(n)}">`).join("");}});}
 /* ================= LA 逻辑分析器（12 路） ================= */
-let laPollT=null, laSamples=null;
+let laPollT=null, laAuto=false, laSamples=null;
 async function laArm(){
+  const mv=$("la_mode").value;
+  laAuto=(mv==="auto");                    /* 自动=无触发连续抓 */
   const r=await post("/api/la",{action:"arm",
     div:parseInt($("la_div").value)||0,post:parseInt($("la_post").value)||2047,
-    mode:parseInt($("la_mode").value)||0,
+    mode:laAuto?0:(parseInt(mv)||0),
     val:parseInt($("la_val").value||"0",0)||0,
-    mask:parseInt($("la_mask").value||"0xFFF",0)});
-  $("la_stat").textContent=r.error?r.error:"武装中…";
+    /* 自动模式 mask=0：码型恒匹配=立即触发，采完即显示并循环重采 */
+    mask:laAuto?0:(parseInt($("la_mask").value||"0xFFF",0)||0)});
+  $("la_stat").textContent=r.error?r.error:(laAuto?"自动采集中…":"武装中…");
   $("la_stat").style.color=r.error?"#e05d5d":"#8fa0b0";
-  if(!r.error&&laPollT===null)laPollT=setInterval(laPoll,400);
+  if(!r.error&&laPollT===null)laPollT=setInterval(laPoll,200);
 }
 async function laStop(){
+  laAuto=false;
   await post("/api/la",{action:"stop"});
   if(laPollT){clearInterval(laPollT);laPollT=null;}
   $("la_stat").textContent="已停止";
@@ -3696,10 +3721,20 @@ async function laPoll(){
   try{
     const s=await post("/api/la",{action:"stat"});
     if(s.error)return;
-    $("la_stat").textContent=
+    $("la_stat").textContent=laAuto?"自动采集中…":
       (s.done?"已采满 ":(s.fired?"已触发，采样中 ":(s.armed?"等待触发 ":"— ")))
       +`（${s.wr} 样本）`;
-    if(s.done){if(laPollT){clearInterval(laPollT);laPollT=null;}laDump();}
+    if(s.done){
+      await laDump();
+      if(laAuto){                     /* 自动模式：立刻重新武装循环刷新 */
+        const r=await post("/api/la",{action:"arm",
+          div:parseInt($("la_div").value)||0,
+          post:parseInt($("la_post").value)||2047,
+          mode:0,val:0,mask:0});
+        if(r.error){clearInterval(laPollT);laPollT=null;
+          $("la_stat").textContent=r.error;}
+      }else if(laPollT){clearInterval(laPollT);laPollT=null;}
+    }
   }catch(e){}
 }
 async function laDump(){
@@ -3732,7 +3767,8 @@ function drawLa(){
   }
   x.strokeStyle="#e05d5d";x.setLineDash([4,3]);
   x.beginPath();x.moveTo(lab,0);x.lineTo(lab,H);x.stroke();x.setLineDash([]);
-  x.fillStyle="#e05d5d";x.font="10px monospace";x.fillText("触发",lab+4,12);
+  x.fillStyle="#e05d5d";x.font="10px monospace";
+  x.fillText(laAuto?"起点":"触发",lab+4,12);
 }
 /* ================= 时间线（异常 + ITM 事件归并） ================= */
 function renderTl2(s){
