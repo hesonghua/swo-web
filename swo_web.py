@@ -190,6 +190,12 @@ class State:
         self.sleep_pct = 0.0
         # JTAG Vref（mV，None=未知/无硬件）；vref_loop 低频刷新
         self.vref_mv = None
+        # 变量触发（示波器式，watch_loop 后端检测）：
+        # mode: "off"|"rise"|"fall"|"any"|"gt"|"lt"（沿=跨越阈值；
+        #       升沿 prev<V≤cur，降沿 prev≥V>cur；gt/lt=电平）
+        # armed 后首个样本只做基线；命中置 fired={t,v}（一次性，UI 冻结定格）
+        self.trig = {"mode": "off", "var": "", "v": 0.0}
+        self.trig_fired = None      # {"t","v"} 或 None
         self.dwt_raw = [0] * 6
         self.pc_on = False
         self.exc_on = False
@@ -921,6 +927,23 @@ def w_push_val(w, v):
     return v
 
 
+def w_trig_num(w, word):
+    """触发比较用的数值：按 fmt 转成 int/float（f32/f64 的 series 存的是
+    IEEE754 位模式，负数当 int 比较会错序，必须解包成浮点）。"""
+    if word is None:
+        return None
+    try:
+        if w["fmt"] == "f32":
+            return struct.unpack("<f", struct.pack("<I", word))[0]
+        if w["fmt"] == "f64" and w["size"] == 8:
+            return struct.unpack("<d", struct.pack("<Q", word))[0]
+        if isinstance(word, str):        # u64/i64 >2^53 推送编码前的原值不会是
+            return int(word)             # str——防御历史缓存
+        return int(word)
+    except (ValueError, TypeError, struct.error):
+        return None
+
+
 def watch_setfmt(name, fmt):
     """行内改格式：只换解释（f32/i32/hex 互换不动提取）；u16/u8 连子字
     提取宽度一起换。"""
@@ -1030,6 +1053,26 @@ async def watch_loop():
                             word = (word >> sh) & ((1 << (w["size"] * 8)) - 1)
                     w["series"].append((now, word))
                     w["n"] = w.get("n", 0) + 1
+                    # 触发检测（后端逐样本，不丢点）：武装未触发 + 本变量
+                    cur_n = w_trig_num(w, word)
+                    prev_n = w.pop("_tprev", None) if ST.trig_fired is None \
+                        else None
+                    if ST.trig_fired is None and ST.trig["mode"] != "off" \
+                            and ST.trig["var"] == w["name"]:
+                        if cur_n is not None and prev_n is not None:
+                            V = ST.trig["v"]
+                            m = ST.trig["mode"]
+                            hit = ((m == "rise" and prev_n < V <= cur_n) or
+                                   (m == "fall" and prev_n >= V > cur_n) or
+                                   (m == "any" and
+                                        (prev_n < V <= cur_n or
+                                         prev_n >= V > cur_n)) or
+                                   (m == "gt" and cur_n > V) or
+                                   (m == "lt" and cur_n < V))
+                            if hit:
+                                ST.trig_fired = {"t": now, "v": cur_n}
+                    if ST.trig_fired is None:
+                        w["_tprev"] = cur_n      # 基线滚动（触发后停更）
         except Exception:
             pass
         await asyncio.sleep(max(0.05, ST.watch_ms / 1000.0))
@@ -1342,7 +1385,11 @@ async def ws_pusher(sess):
                             "size": w["size"], "fmt": w["fmt"],
                             "win": w.get("win", 1),
                             "full": full_w, "pts": pts})
-                    payload["data"] = {"watches": watches}
+                    payload["data"] = {"watches": watches,
+                                       # 触发状态随 watch 推送（8fps）：
+                                       # 前端见 fired 即冻结定格
+                                       "trig": dict(ST.trig),
+                                       "fired": ST.trig_fired}
                 elif tab == "dwt":
                     payload["data"] = {
                         "mhz": round(ST.mhz, 2),
@@ -1484,6 +1531,25 @@ async def ws_dispatch(sess, m):
         elif act == "setwin":
             ok, werr = watch_setwin(name, m.get("win", 1))
             reply({"t": "resp", "ok": ok, "error": werr or None})
+        elif act == "trig":
+            # 示波器式触发：mode=off|rise|fall|any|gt|lt，var=变量名，v=阈值
+            mode = str(m.get("mode", "off"))
+            if mode not in ("off", "rise", "fall", "any", "gt", "lt"):
+                reply({"t": "resp", "error": "bad mode"})
+            elif mode != "off" and not any(
+                    w["name"] == str(m.get("var", ""))
+                    for w in ST.watches):
+                reply({"t": "resp", "error": "未找到变量"})
+            else:
+                try:
+                    v = float(m.get("v", 0) or 0)
+                except (TypeError, ValueError):
+                    v = 0.0
+                ST.trig = {"mode": mode, "var": str(m.get("var", "")), "v": v}
+                ST.trig_fired = None
+                for w in ST.watches:       # 重新武装：基线作废重来
+                    w.pop("_tprev", None)
+                reply({"t": "resp", "trig": dict(ST.trig)})
         elif act == "rate":
             ST.watch_ms = max(50, min(5000,
                                        int(m.get("ms", 50) or 50)))
@@ -1820,7 +1886,9 @@ async def handle_http(reader, writer):
                              "sz": (f[1] or f[0]) - f[0]} if f else None,
                     "rows": [[*r] for r in rows]})
             elif p == "/api/watches":
-                json_resp(writer, {"watches": [
+                json_resp(writer, {"trig": dict(ST.trig),
+                                   "fired": ST.trig_fired,
+                                   "watches": [
                     {"name": w["name"], "addr": f"0x{w['addr']:08x}",
                      "size": w["size"], "fmt": w["fmt"],
                      "win": w.get("win", 1),
@@ -1967,6 +2035,25 @@ async def handle_http(reader, writer):
                         json_resp(writer, {"error": werr}, 400)
                         return
                     json_resp(writer, {"count": len(ST.watches)})
+                    return
+                if act == "trig":
+                    mode = str(body.get("mode", "off"))
+                    tvar = str(body.get("var", ""))
+                    try:
+                        tv = float(body.get("v", 0) or 0)
+                    except (TypeError, ValueError):
+                        tv = 0.0
+                    if mode not in ("off", "rise", "fall", "any", "gt", "lt"):
+                        json_resp(writer, {"error": "bad mode"}, 400)
+                    elif mode != "off" and not any(
+                            w["name"] == tvar for w in ST.watches):
+                        json_resp(writer, {"error": f"未找到变量: {tvar}"}, 400)
+                    else:
+                        ST.trig = {"mode": mode, "var": tvar, "v": tv}
+                        ST.trig_fired = None
+                        for w in ST.watches:
+                            w.pop("_tprev", None)
+                        json_resp(writer, {"trig": dict(ST.trig)})
                     return
                 elif act == "del":
                     ST.watches = [w for w in ST.watches if w["name"] != name]
@@ -2509,7 +2596,13 @@ color:var(--dim);flex:none;white-space:nowrap;overflow:hidden}
   </select>
   <label class="sw" style="font-size:11.5px"><input type="checkbox" id="wpause" onchange="wPause(this.checked)"><i></i><span>暂停显示</span></label>
   <select id="wtrigvar" title="触发变量"></select>
-  <select id="wtrigcmp"><option value="&gt;">&gt;</option><option value="&lt;">&lt;</option></select>
+  <select id="wtrigcmp" title="触发模式：沿=跨越阈值（↑=升跨 ↓=降跨 ⇅=双向）；电平=值越过即触发">
+   <option value="rise">↑沿</option>
+   <option value="fall">↓沿</option>
+   <option value="any">⇅沿</option>
+   <option value="gt">&gt;电平</option>
+   <option value="lt">&lt;电平</option>
+  </select>
   <input type="text" class="sm" id="wtrigv" placeholder="阈值" style="width:64px">
   <button class="tbtn" id="wtrigbtn" onclick="wTrigToggle()">触发：关</button>
  </div>
@@ -3139,15 +3232,21 @@ function wMode(m){wModeV=m;
 function wPause(p){wPaused=p;
  if(!p&&!wTrig.fired){wDisp=null;wFrozenOk=false;}   // 解冻回实时
  drawW();}
-function wTrigToggle(){
+async function wTrigToggle(){
  if(wTrig.on&&wTrig.fired){          // 触发后再点 = 取消触发，回实时
    wTrig.on=false;wTrig.fired=false;wTrig.capEnd=0;
    wDisp=null;wFrozenOk=false;
+   post("/api/watch",{action:"trig",mode:"off"});
    $("wtrigbtn").textContent="触发：关";drawW();return;}
  wTrig.on=!wTrig.on;wTrig.fired=false;
  wTrig.var=$("wtrigvar").value;wTrig.cmp=$("wtrigcmp").value;
  wTrig.v=parseFloat($("wtrigv").value)||0;
- if(wTrig.on){wDisp=null;wFrozenOk=false;}
+ if(wTrig.on){wDisp=null;wFrozenOk=false;
+   /* 检测在后端 watch_loop（采样稳不丢点）；这里只下发配置 */
+   const r=await post("/api/watch",{action:"trig",mode:wTrig.cmp,
+                                    var:wTrig.var,v:wTrig.v});
+   if(r.error){wTrig.on=false;$("winfo").textContent=r.error;}
+   else wTrig.t0=0;}
  $("wtrigbtn").textContent=wTrig.on?"触发：武装":"触发：关";
  drawW();}
 function fillTrigSels(){
@@ -3177,18 +3276,17 @@ function renderWatch(s){
     else for(const p of w.pts){
       c.series.push(p);if(c.series.length>600)c.series.shift();}
     wCache[w.name]=c;return c;});
+  const srvFired=s.fired;            // 后端触发事件（覆盖 s 前保存）
   s={watches:list};
   wData=s;
-  /* 触发状态机：武装→(命中,记 t0)→采集中(live 继续)→采满后半窗→定格 */
-  if(wTrig.on&&!wTrig.fired){
-    const w=s.watches.find(x=>x.name===wTrig.var);
-    const cur=w&&w.series.length?wNum(w,w.series[w.series.length-1][1]):null;
-    if(cur!=null&&(wTrig.cmp===">"?cur>wTrig.v:cur<wTrig.v)){
+  /* 触发状态机：武装→(后端命中,记 t0)→采集中(live 继续)→采满后半窗→定格。
+   * 检测在后端 watch_loop（沿=跨越阈值，电平=越过），事件随 watch 推送 */
+  if(wTrig.on&&!wTrig.fired&&srvFired&&srvFired.t){
       wTrig.fired=true;
-      wTrig.t0=w.series[w.series.length-1][0];
+      wTrig.t0=srvFired.t;
       const tb=parseFloat($("wtb").value)||0;
       wTrig.capEnd=wTrig.t0+(tb>0?tb/2:1.0);
-      $("wtrigbtn").textContent="触发：采集中…";}}
+      $("wtrigbtn").textContent="触发：采集中…";}
   let latest=-Infinity;
   for(const w of s.watches)if(w.series.length)
     latest=Math.max(latest,w.series[w.series.length-1][0]);
@@ -3375,7 +3473,7 @@ function drawLine(s){
     x.fillText(tb>0?fmtT2((t1-t0)/NX)+"/div":"全部历史",pad.l,y0+11-14<0?4:y0-3);
     if(wTrig.on){
       x.fillStyle=wTrig.fired?"#e05d5d":"#e6b35a";
-      const tag=(wTrig.cmp===">"?"↑":"↓")+" "+wTrig.v;
+      const tag=({rise:"↑",fall:"↓",any:"⇅",gt:">",lt:"<"}[wTrig.cmp]||"?")+" "+wTrig.v;
       x.fillText(wTrig.fired?`TRIG'D ${tag}`:`TRIG ${tag}`,W-pad.r-110,y0-3>0?y0-3:10);}}
   if(wi===nw-1){
     x.fillStyle=cvc("#5b6b7c","#66778a");x.font="10px monospace";
